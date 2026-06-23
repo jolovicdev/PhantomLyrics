@@ -12,6 +12,8 @@ there is no .ico file dependency — works in dev and in a PyInstaller build.
 """
 
 import logging
+import os
+import sys
 
 from PySide6.QtCore import QObject, QSize
 from PySide6.QtGui import QAction, QIcon, QPainter, QPixmap, QColor, QPainterPath
@@ -27,41 +29,58 @@ logger = logging.getLogger(__name__)
 _ICON_SIZE = 64
 
 
+def _get_icon_path() -> str:
+    """
+    Find notes.ico — works both when running from source (project folder)
+    and when running as a PyInstaller exe (bundled in _internal/).
+    """
+    # When running from source, the icon is in the project root
+    local_icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes.ico")
+    if os.path.exists(local_icon):
+        return local_icon
+
+    # When running as a PyInstaller exe, it's bundled in _internal/
+    if hasattr(sys, "_MEIPASS"):
+        bundled = os.path.join(sys._MEIPASS, "notes.ico")
+        if os.path.exists(bundled):
+            return bundled
+
+    return ""
+
+
 def _make_tray_icon() -> QIcon:
     """
-    Draw a simple music-note icon programmatically.
-    White note on a dark circular background — readable in both light
-    and dark system tray areas.
+    Load the tray icon from notes.ico. Falls back to a programmatically
+    drawn music-note icon if the file isn't found.
     """
+    icon_path = _get_icon_path()
+    if icon_path:
+        icon = QIcon(icon_path)
+        if not icon.isNull():
+            return icon
+        logger.debug(f"notes.ico found but couldn't be loaded: {icon_path}")
+
+    # Fallback: draw a simple music-note icon programmatically
+    logger.info("Using fallback programmatic tray icon (notes.ico not found)")
     pixmap = QPixmap(QSize(_ICON_SIZE, _ICON_SIZE))
-    pixmap.fill(QColor(0, 0, 0, 0))  # Transparent
+    pixmap.fill(QColor(0, 0, 0, 0))
 
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-    # Dark rounded-square backdrop (so the note is visible on light trays)
     painter.setBrush(QColor(30, 30, 30, 230))
     painter.setPen(QColor(0, 0, 0, 0))
     painter.drawRoundedRect(4, 4, _ICON_SIZE - 8, _ICON_SIZE - 8, 14, 14)
-
-    # Music note (two note heads + stems) in white
     painter.setBrush(QColor(255, 255, 255, 255))
     painter.setPen(QColor(0, 0, 0, 0))
-
-    # Stem (vertical bar)
     painter.drawRect(34, 16, 4, 26)
-    # Upper note flag
     path = QPainterPath()
     path.moveTo(38, 16)
     path.cubicTo(50, 20, 48, 30, 40, 32)
     path.lineTo(38, 32)
     path.closeSubpath()
     painter.drawPath(path)
-    # Lower note head (ellipse)
     painter.drawEllipse(24, 40, 12, 9)
-    # Upper note head (ellipse)
     painter.drawEllipse(34, 36, 12, 9)
-
     painter.end()
     return QIcon(pixmap)
 

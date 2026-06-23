@@ -23,7 +23,7 @@ from PyInstaller.utils.hooks import collect_submodules
 hiddenimports = ["websockets"]
 hiddenimports += collect_submodules("pynput")
 
-datas = []
+datas = [("notes.ico", ".")]   # Bundle the tray icon with the exe
 binaries = []
 
 a = Analysis(
