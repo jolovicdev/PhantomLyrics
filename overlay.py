@@ -330,17 +330,21 @@ class LyricsOverlay(QWidget):
             """Horizontal x so text is centered within the overlay width."""
             return (overlay_width - fm.horizontalAdvance(text)) // 2
 
-        # ── Song info line (very subtle) ──────────────────
-        if self._song_title:
+        # ── Song info line (only on hover, for a clean minimalist look) ──
+        show_song_info = self._hovered and self._song_title
+        if show_song_info:
             painter.setFont(font)
             info_text = f"{self._song_artist} — {self._song_title}" if self._song_artist else self._song_title
             baseline = fm.ascent() + 4
             self._draw_outlined_text(painter, center_x(info_text), baseline, info_text, self._cfg.song_info_alpha)
 
+        # Determine where the lyrics start: below the title if shown, else at top
+        lyrics_top = (line_height + self._cfg.title_gap_px) if show_song_info else 4
+
         # ── "No lyrics found" message ─────────────────────
         if self._no_lyrics:
             painter.setFont(font)
-            y_offset = line_height + self._cfg.title_gap_px  # gap below song info
+            y_offset = lyrics_top
             self._draw_outlined_text(
                 painter, center_x(NO_LYRICS_MESSAGE), y_offset + fm.ascent(), NO_LYRICS_MESSAGE, self._cfg.inactive_line_alpha
             )
@@ -354,7 +358,7 @@ class LyricsOverlay(QWidget):
         # ── Lyric lines ───────────────────────────────────
         visible_lines = self._get_visible_window()
 
-        y_offset = line_height + self._cfg.title_gap_px  # gap below song info
+        y_offset = lyrics_top
 
         for idx, line_text in visible_lines:
             painter.setFont(font)
