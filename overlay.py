@@ -82,6 +82,11 @@ SYNC_BTN_MARGIN = 8           # Margin from the overlay's top-right edge
 CONFIG_DIR = Path.home() / ".phantom_lyrics"
 POSITION_FILE = CONFIG_DIR / "overlay_position.json"
 
+# Gaming mode hotkey — toggles click-through so clicks pass through the
+# overlay to the game behind it. Uses a global hotkey (pynput) so it works
+# even when the game has keyboard focus.
+GAMING_TOGGLE_HOTKEY = '<ctrl>+<alt>+space'
+
 
 # ─── The Overlay Widget ────────────────────────────────────────
 
@@ -95,6 +100,7 @@ class LyricsOverlay(QWidget):
     # Signals to safely update UI state from any thread
     update_requested = Signal()
     sync_offset_changed = Signal(str, str, float)  # (artist, title, new_offset)
+    gaming_toggle_requested = Signal()             # Global hotkey → Qt thread
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -115,6 +121,8 @@ class LyricsOverlay(QWidget):
         self._pressed_btn: str | None = None              # Which button was just pressed (flash effect)
         self._feedback_text: str = ""                     # Temporary toast text (e.g. "Sync: +1.0s")
         self._feedback_until: float = 0.0                 # Monotonic time when the toast expires
+        self._gaming_mode: bool = False                   # Click-through lock for gaming
+        self._hotkey_listener = None                      # pynput global hotkey listener
 
         # ── Drag state ───────────────────────────────────────
         self._drag_offset = None  # QPoint: cursor-to-window-origin offset while dragging
@@ -122,6 +130,7 @@ class LyricsOverlay(QWidget):
         # ── Setup ────────────────────────────────────────────
         self._init_window()
         self._init_timer()
+        self._init_hotkey()
 
         # The whole overlay is grabbable — hint with a move cursor
         self.setCursor(Qt.CursorShape.SizeAllCursor)
@@ -304,8 +313,51 @@ class LyricsOverlay(QWidget):
         self._timer.setInterval(TICK_INTERVAL_MS)
         self._timer.start()
 
-        # Connect the signal for cross-thread updates
+        # Connect signals for cross-thread updates
         self.update_requested.connect(self._on_update_requested)
+        self.gaming_toggle_requested.connect(self._on_gaming_toggle)
+
+    def _init_hotkey(self) -> None:
+        """Register a global hotkey to toggle gaming (click-through) mode."""
+        try:
+            from pynput import keyboard
+        except ImportError:
+            logger.warning(
+                "pynput not installed — gaming-mode hotkey disabled. "
+                "Install with: pip install pynput"
+            )
+            return
+
+        try:
+            self._hotkey_listener = keyboard.GlobalHotKeys(
+                {GAMING_TOGGLE_HOTKEY: self._on_hotkey_pressed}
+            )
+            self._hotkey_listener.start()
+            logger.info("Gaming toggle hotkey registered: %s", GAMING_TOGGLE_HOTKEY)
+        except Exception:
+            logger.exception("Could not register global hotkey.")
+            self._hotkey_listener = None
+
+    def _on_hotkey_pressed(self) -> None:
+        """Runs on the pynput thread — marshal to the Qt thread via signal."""
+        self.gaming_toggle_requested.emit()
+
+    @Slot()
+    def _on_gaming_toggle(self) -> None:
+        """Toggle between draggable and click-through (gaming) modes."""
+        self._gaming_mode = not self._gaming_mode
+        self._apply_window_styles(click_through=self._gaming_mode)
+
+        if self._gaming_mode:
+            self.unsetCursor()
+            self._feedback_text = "Gaming mode ON — click-through active"
+        else:
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+            self._feedback_text = "Gaming mode OFF — draggable"
+
+        self._feedback_until = time.monotonic() + 2.0
+        logger.info(self._feedback_text)
+        self.update()
 
     # ─── Event Overrides ──────────────────────────────────────
 
@@ -671,8 +723,10 @@ class LyricsOverlay(QWidget):
             logger.debug("Could not load overlay position.", exc_info=True)
 
     def closeEvent(self, event) -> None:
-        """Save the position on close so the next launch restores it."""
+        """Save the position and stop the hotkey listener on close."""
         self._save_position()
+        if self._hotkey_listener is not None:
+            self._hotkey_listener.stop()
         super().closeEvent(event)
 
     # ─── Window styles (platform-specific) ───────────────────
@@ -680,18 +734,21 @@ class LyricsOverlay(QWidget):
     def showEvent(self, event) -> None:
         """Apply transparency / no-focus styles after the window is shown."""
         super().showEvent(event)
-        self._apply_window_styles()
+        self._apply_window_styles(click_through=False)
 
-    def _apply_window_styles(self) -> None:
+    def _apply_window_styles(self, click_through: bool = False) -> None:
         """
         Set Win32 extended styles for the overlay.
 
         WS_EX_LAYERED    → required for per-pixel alpha (transparent background).
         WS_EX_NOACTIVATE → window never steals focus (your game keeps focus
                            even when you click/drag the overlay).
+        WS_EX_TRANSPARENT → click-through: mouse events pass through to the
+                            game behind the overlay (gaming mode).
 
-        Note: WS_EX_TRANSPARENT (click-through) is intentionally NOT set, so
-        the overlay stays grabbable for drag-and-drop at all times.
+        Args:
+            click_through: True for gaming mode (clicks pass through);
+                           False for draggable mode (overlay is grabbable).
         """
         if sys.platform != "win32":
             logger.debug("Window styles are only applied on Windows.")
@@ -706,6 +763,12 @@ class LyricsOverlay(QWidget):
             ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
             ex_style |= win32con.WS_EX_LAYERED
             ex_style |= win32con.WS_EX_NOACTIVATE
+
+            if click_through:
+                ex_style |= win32con.WS_EX_TRANSPARENT
+            else:
+                ex_style &= ~win32con.WS_EX_TRANSPARENT
+
             win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex_style)
 
         except ImportError:

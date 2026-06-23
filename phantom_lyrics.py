@@ -53,8 +53,8 @@ from PySide6.QtWidgets import QApplication
 
 from overlay import LyricsOverlay
 from websocket_server import LyricsWebSocketServer
-from browser_monitor import BrowserMonitor, clean_youtube_title, split_artist_title
-from lyrics_fetcher import search_lyrics, init_cache, get_sync_offset, save_sync_offset
+from title_utils import clean_youtube_title, split_artist_title
+from lyrics_fetcher import search_lyrics, init_cache, save_sync_offset
 from tray import TrayController
 from config import load_config, Config
 
@@ -66,10 +66,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("phantom_lyrics")
-
-# Browser monitor fallback: only fire if no WebSocket message arrived in this
-# many seconds (the WS title detection is primary and handles background tabs).
-_MONITOR_FALLBACK_TIMEOUT_S = 30.0
 
 
 # ─── Main Application Controller ─────────────────────────────────
@@ -98,7 +94,6 @@ class PhantomLyricsApp:
         # Persist sync offset changes to the lyrics cache
         self._overlay.sync_offset_changed.connect(self._on_sync_offset_changed)
         self._ws_server: Optional[LyricsWebSocketServer] = None
-        self._browser_monitor: Optional[BrowserMonitor] = None
         self._tray: Optional[TrayController] = None
         self._fetch_lock = threading.Lock()
         self._current_artist: str = ""
@@ -111,7 +106,6 @@ class PhantomLyricsApp:
         self._last_current_time: float = 0.0
         self._last_advance_time: float = 0.0   # monotonic time of last currentTime advance
         self._player_lock = threading.Lock()   # guards the three fields above
-        self._last_ws_activity: float = 0.0    # For browser_monitor fallback gating
 
     # ─── Lifecycle ──────────────────────────────────────────
 
@@ -137,21 +131,11 @@ class PhantomLyricsApp:
         )
         self._ws_server.start()
 
-        # 3. Start the browser title monitor (fallback only — the WebSocket
-        #    title detection is primary and handles background tabs. The monitor
-        #    only fires if no WS message arrived in _MONITOR_FALLBACK_TIMEOUT_S,
-        #    e.g. the extension isn't loaded or the tab isn't a YouTube page).
-        self._browser_monitor = BrowserMonitor(
-            on_song_change=self._on_song_change_from_monitor,
-            poll_interval=2.0,
-        )
-        self._browser_monitor.start()
-
-        # 4. System tray icon (visibility toggle, reset position, settings, quit)
+        # 3. System tray icon (visibility toggle, reset position, settings, quit)
         self._tray = TrayController(self._overlay, self._config, on_quit=self._qt_app.quit)
         self._tray.setup()
 
-        # 5. Handle Ctrl+C gracefully
+        # 4. Handle Ctrl+C gracefully
         signal.signal(signal.SIGINT, self._handle_sigint)
         # On Windows, Qt needs a timer to process Python signals
         self._sig_timer = QTimer()
@@ -168,8 +152,6 @@ class PhantomLyricsApp:
     def _shutdown(self) -> None:
         """Gracefully stop all background services."""
         logger.info("Shutting down...")
-        if self._browser_monitor:
-            self._browser_monitor.stop()
         if self._ws_server:
             self._ws_server.stop()
         logger.info("Phantom Lyrics exited cleanly.")
@@ -213,7 +195,6 @@ class PhantomLyricsApp:
         # Any WebSocket message means the extension is alive — mark activity
         # so the overlay doesn't auto-hide (even while paused).
         self._overlay.mark_activity()
-        self._last_ws_activity = time.monotonic()
 
         now = time.monotonic()
         is_advancing = False
@@ -287,25 +268,9 @@ class PhantomLyricsApp:
                 self._active_player_id = None
                 self._last_current_time = 0.0
 
-    def _on_song_change_from_monitor(self, artist: str, title: str) -> None:
-        """
-        Callback for the browser monitor (window title polling).
-
-        This is a FALLBACK — it only fires if no WebSocket message has arrived
-        recently (the extension isn't loaded, or the tab isn't a YouTube page).
-        If the WS is active, the monitor is silently ignored to avoid
-        duplicate fetches.
-        """
-        if self._last_ws_activity > 0:
-            idle = time.monotonic() - self._last_ws_activity
-            if idle < _MONITOR_FALLBACK_TIMEOUT_S:
-                return  # WebSocket is handling song detection
-        self._on_song_change(artist, title)
-
     def _on_song_change(self, artist: str, title: str) -> None:
         """
-        Called from the browser monitor thread when a new song is detected
-        in the Firefox window title.
+        Called when a new song is detected (via the WebSocket title).
 
         Triggers a background lyrics fetch.
 

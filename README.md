@@ -7,15 +7,15 @@ A "ghost-like" desktop overlay that displays synchronized song lyrics anywhere o
 ```
 YouTube (Firefox) ──► Firefox Extension ──WebSocket──► Python App
         │                                                    │
-        └── Window Title ──► Browser Monitor ──► Lyrics Fetch (LRCLib → NetEase)
+        └── Page Title ──► Title Parser ──► Lyrics Fetch (LRCLib → NetEase)
                                                              │
                                                 PySide6 Overlay Window ◄──
 ```
 
 1. **Firefox Extension** sends the exact video timestamp and page title via WebSocket (works even with the YouTube tab in the background).
-2. **Lyrics Fetcher** queries LRCLib first, then falls back to NetEase Cloud Music for tracks LRCLib doesn't have. Results are cached to disk.
-3. **PySide6 Overlay** displays lyrics with a transparent, always-on-top, free-draggable window with subtitle-style outlined text.
-4. **Browser Monitor** is a fallback — it polls the Firefox window title only if the extension isn't sending data (e.g. extension not loaded).
+2. **Title Parser** cleans the YouTube page title into "Artist - Title" (handles en-dash, em-dash, tab counters, video tags).
+3. **Lyrics Fetcher** queries LRCLib first, then falls back to NetEase Cloud Music for tracks LRCLib doesn't have. Results are cached to disk.
+4. **PySide6 Overlay** displays lyrics with a transparent, always-on-top, free-draggable window with subtitle-style outlined text.
 
 ## Project Structure
 
@@ -24,11 +24,12 @@ Phantom Lyrics/
 ├── phantom_lyrics.py      # Main app — orchestrates everything
 ├── overlay.py             # PySide6 transparent overlay window
 ├── websocket_server.py    # Local WebSocket server (receives timestamps)
-├── browser_monitor.py     # Firefox window title polling (fallback)
+├── title_utils.py         # YouTube title cleaning + artist/title splitting
 ├── lyrics_fetcher.py      # LRCLib + NetEase API client, LRC parser, disk cache
 ├── config.py              # User settings (load/save from ~/.phantom_lyrics/config.json)
 ├── settings_dialog.py     # Settings dialog (font, opacity, layout, auto-hide)
 ├── tray.py                # System tray icon (toggle, reset, settings, quit)
+├── test_phantom_lyrics.py # Unit tests for pure functions
 ├── phantom_lyrics.spec    # PyInstaller build config
 ├── requirements.txt       # Runtime Python dependencies
 ├── requirements-dev.txt   # Dev dependencies (includes PyInstaller)
@@ -46,6 +47,8 @@ pip install -r requirements.txt
 ```
 
 ### 2. Load the Firefox Extension
+
+The extension is **required** — it's how the app detects the current song and syncs lyrics. Without it, no lyrics will appear.
 
 1. Open Firefox.
 2. Go to `about:debugging#/runtime/this-firefox`.
@@ -73,6 +76,14 @@ pyinstaller phantom_lyrics.spec --noconfirm
 ```
 
 The executable is created in `dist/PhantomLyrics/PhantomLyrics.exe`. Run it directly — no Python install needed. The Firefox extension still needs to be loaded separately.
+
+### 6. Run Tests (optional)
+
+```powershell
+python test_phantom_lyrics.py
+```
+
+Tests cover the pure functions: title cleaning, artist/title splitting, LRC parsing, and title similarity scoring.
 
 ## System Tray
 
@@ -139,6 +150,18 @@ If no source has the song, the overlay shows "No lyrics found for this song."
 - The overlay never steals focus, so your game keeps keyboard/mouse input.
 - The overlay has no title bar, no taskbar icon, and doesn't appear in Alt+Tab.
 
+### Gaming Mode (Click-Through)
+
+When you're playing a game, the overlay can block mouse clicks in its area since it's grabbable for dragging. **Gaming mode** fixes this:
+
+- Press **`Ctrl+Alt+Space`** to toggle **gaming mode**.
+  - The overlay becomes **click-through** — mouse clicks pass straight through to the game.
+  - You can still see the lyrics, but can't interact with the overlay.
+- Press **`Ctrl+Alt+Space`** again to exit gaming mode.
+  - The overlay becomes draggable again.
+
+The hotkey works system-wide, even when the game has keyboard focus.
+
 ## Repositioning the Overlay
 
 The overlay is **free-draggable** — no lock, no hotkey, no toggle.
@@ -181,6 +204,7 @@ The overlay is **free-draggable** — no lock, no hotkey, no toggle.
 - **pywin32** — Windows API (layered window, no-focus, window enumeration)
 - **websockets** — Async WebSocket server
 - **requests** — LRCLib + NetEase API client
+- **pynput** — Global hotkey for gaming-mode toggle
 - **Firefox WebExtension** — YouTube timestamp extraction
 
 ## Credits

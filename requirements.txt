@@ -12,3 +12,6 @@ websockets>=12.0
 
 # HTTP requests for LRCLib API
 requests>=2.31.0
+
+# Global hotkey listener for gaming-mode toggle (click-through lock)
+pynput>=1.7.6
