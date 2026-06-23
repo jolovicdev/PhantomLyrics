@@ -331,15 +331,16 @@ class LyricsOverlay(QWidget):
             return (overlay_width - fm.horizontalAdvance(text)) // 2
 
         # ── Song info line (only on hover, for a clean minimalist look) ──
-        show_song_info = self._hovered and self._song_title
-        if show_song_info:
+        # Space for the title is always reserved so lyrics don't shift when
+        # it appears/disappears — only the text is painted on hover.
+        if self._hovered and self._song_title:
             painter.setFont(font)
             info_text = f"{self._song_artist} — {self._song_title}" if self._song_artist else self._song_title
             baseline = fm.ascent() + 4
             self._draw_outlined_text(painter, center_x(info_text), baseline, info_text, self._cfg.song_info_alpha)
 
-        # Determine where the lyrics start: below the title if shown, else at top
-        lyrics_top = (line_height + self._cfg.title_gap_px) if show_song_info else 4
+        # Lyrics always start at the same fixed position (title space reserved)
+        lyrics_top = line_height + self._cfg.title_gap_px
 
         # ── "No lyrics found" message ─────────────────────
         if self._no_lyrics:
