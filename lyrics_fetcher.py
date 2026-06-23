@@ -123,7 +123,7 @@ def parse_lrc(lrc_text: str) -> list[LyricLine]:
 _session = requests.Session()
 _session.headers.update(
     {
-        "User-Agent": "PhantomLyrics/1.0 (Desktop Overlay; +https://github.com/phantom-lyrics)",
+        "User-Agent": "PhantomLyrics/1.0 (Desktop Overlay; +https://github.com/Anngiie/PhantomLyrics)",
         "Accept": "application/json",
     }
 )
