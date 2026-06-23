@@ -65,7 +65,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,              # Uses the bundled Qt icon; add an .ico path here if desired
+    icon="notes.ico",          # Custom app icon (music note)
 )
 
 coll = COLLECT(
