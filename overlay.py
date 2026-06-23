@@ -333,11 +333,16 @@ class LyricsOverlay(QWidget):
         # ── Song info line (only on hover, for a clean minimalist look) ──
         # Space for the title is always reserved so lyrics don't shift when
         # it appears/disappears — only the text is painted on hover.
+        # The title uses a smaller font than the lyrics.
         if self._hovered and self._song_title:
-            painter.setFont(font)
+            title_font = QFont(self._cfg.font_family, max(self._cfg.font_size - 3, 8))
+            title_fm = QFontMetrics(title_font)
+            painter.setFont(title_font)
             info_text = f"{self._song_artist} — {self._song_title}" if self._song_artist else self._song_title
-            baseline = fm.ascent() + 4
-            self._draw_outlined_text(painter, center_x(info_text), baseline, info_text, self._cfg.song_info_alpha)
+            # Center the smaller title vertically in the reserved line_height space
+            title_baseline = 4 + (line_height - title_fm.height()) // 2 + title_fm.ascent()
+            title_x = (overlay_width - title_fm.horizontalAdvance(info_text)) // 2
+            self._draw_outlined_text(painter, title_x, title_baseline, info_text, self._cfg.song_info_alpha)
 
         # Lyrics always start at the same fixed position (title space reserved)
         lyrics_top = line_height + self._cfg.title_gap_px
