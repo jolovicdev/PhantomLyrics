@@ -16,13 +16,10 @@ Run it directly:
 """
 
 import sys
-from PyInstaller.utils.hooks import collect_submodules
 
 # PySide6 has many Qt plugins (platforms, styles, image formats) that must
 # be collected explicitly so the packaged app can create a QApplication.
-hiddenimports = []
-hiddenimports += collect_submodules("pynput") if "pynput" in sys.modules else []
-hiddenimports += ["websockets"]
+hiddenimports = ["websockets"]
 
 datas = []
 binaries = []

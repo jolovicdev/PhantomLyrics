@@ -4,6 +4,7 @@ Phantom Lyrics - System Tray Icon
 A system tray icon that lets the user control the app without the terminal:
   - Toggle overlay visibility (left-click the tray icon or menu)
   - Reset overlay position to the bottom-left default
+  - Settings dialog (font, opacity, layout, auto-hide)
   - Quit the application
 
 The icon is drawn programmatically (a white music note on transparent) so
@@ -17,6 +18,8 @@ from PySide6.QtGui import QAction, QIcon, QPainter, QPixmap, QColor, QPainterPat
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
 from overlay import LyricsOverlay
+from config import Config
+from settings_dialog import SettingsDialog
 
 logger = logging.getLogger(__name__)
 
@@ -72,9 +75,10 @@ class TrayController(QObject):
         on_quit: Callback invoked when the user selects "Quit".
     """
 
-    def __init__(self, overlay: LyricsOverlay, on_quit) -> None:
+    def __init__(self, overlay: LyricsOverlay, config: Config, on_quit) -> None:
         super().__init__()
         self._overlay = overlay
+        self._config = config
         self._on_quit = on_quit
         self._tray: QSystemTrayIcon | None = None
 
@@ -102,6 +106,10 @@ class TrayController(QObject):
         reset_action.triggered.connect(self._overlay.reset_position)
         menu.addAction(reset_action)
 
+        settings_action = QAction("Settings...", menu)
+        settings_action.triggered.connect(self._open_settings)
+        menu.addAction(settings_action)
+
         menu.addSeparator()
 
         quit_action = QAction("Quit", menu)
@@ -128,3 +136,12 @@ class TrayController(QObject):
             self._overlay.hide()
         else:
             self._overlay.show()
+
+    def _open_settings(self) -> None:
+        """Open the settings dialog and apply changes to the overlay."""
+        dialog = SettingsDialog(self._config, parent=None)
+        if dialog.exec():
+            new_config = dialog.result_config()
+            if new_config:
+                self._config = new_config
+                self._overlay.apply_config(new_config)

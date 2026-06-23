@@ -54,8 +54,9 @@ from PySide6.QtWidgets import QApplication
 from overlay import LyricsOverlay
 from websocket_server import LyricsWebSocketServer
 from browser_monitor import BrowserMonitor, clean_youtube_title, split_artist_title
-from lyrics_fetcher import search_lyrics, init_cache
+from lyrics_fetcher import search_lyrics, init_cache, get_sync_offset, save_sync_offset
 from tray import TrayController
+from config import load_config, Config
 
 # ─── Logging ────────────────────────────────────────────────────
 
@@ -66,11 +67,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("phantom_lyrics")
 
-# Lock-on + time-advance tuning
-_STALE_LOCK_TIMEOUT_S = 3.0   # Release the lock if currentTime hasn't advanced
-                              # for this many seconds (tab is stuck/glitchy).
-_TIME_ADVANCE_EPSILON = 0.4   # Minimum currentTime increase (seconds) to count
-                              # as "advancing" — filters out tiny jitter.
+# Browser monitor fallback: only fire if no WebSocket message arrived in this
+# many seconds (the WS title detection is primary and handles background tabs).
+_MONITOR_FALLBACK_TIMEOUT_S = 30.0
 
 
 # ─── Main Application Controller ─────────────────────────────────
@@ -94,7 +93,10 @@ class PhantomLyricsApp:
         # Keep the app running when the overlay is hidden via the tray icon
         self._qt_app.setQuitOnLastWindowClosed(False)
 
-        self._overlay = LyricsOverlay()
+        self._config = load_config()
+        self._overlay = LyricsOverlay(self._config)
+        # Persist sync offset changes to the lyrics cache
+        self._overlay.sync_offset_changed.connect(self._on_sync_offset_changed)
         self._ws_server: Optional[LyricsWebSocketServer] = None
         self._browser_monitor: Optional[BrowserMonitor] = None
         self._tray: Optional[TrayController] = None
@@ -109,6 +111,7 @@ class PhantomLyricsApp:
         self._last_current_time: float = 0.0
         self._last_advance_time: float = 0.0   # monotonic time of last currentTime advance
         self._player_lock = threading.Lock()   # guards the three fields above
+        self._last_ws_activity: float = 0.0    # For browser_monitor fallback gating
 
     # ─── Lifecycle ──────────────────────────────────────────
 
@@ -127,22 +130,25 @@ class PhantomLyricsApp:
 
         # 2. Start the WebSocket server for timestamp data
         self._ws_server = LyricsWebSocketServer(
-            host="localhost",
-            port=8765,
+            host=self._config.ws_host,
+            port=self._config.ws_port,
             on_timestamp=self._on_timestamp,
             on_disconnect=self._on_disconnect,
         )
         self._ws_server.start()
 
-        # 3. Start the browser title monitor
+        # 3. Start the browser title monitor (fallback only — the WebSocket
+        #    title detection is primary and handles background tabs. The monitor
+        #    only fires if no WS message arrived in _MONITOR_FALLBACK_TIMEOUT_S,
+        #    e.g. the extension isn't loaded or the tab isn't a YouTube page).
         self._browser_monitor = BrowserMonitor(
-            on_song_change=self._on_song_change,
+            on_song_change=self._on_song_change_from_monitor,
             poll_interval=2.0,
         )
         self._browser_monitor.start()
 
-        # 4. System tray icon (visibility toggle, reset position, quit)
-        self._tray = TrayController(self._overlay, on_quit=self._qt_app.quit)
+        # 4. System tray icon (visibility toggle, reset position, settings, quit)
+        self._tray = TrayController(self._overlay, self._config, on_quit=self._qt_app.quit)
         self._tray.setup()
 
         # 5. Handle Ctrl+C gracefully
@@ -207,13 +213,17 @@ class PhantomLyricsApp:
         # Any WebSocket message means the extension is alive — mark activity
         # so the overlay doesn't auto-hide (even while paused).
         self._overlay.mark_activity()
+        self._last_ws_activity = time.monotonic()
 
         now = time.monotonic()
         is_advancing = False
 
+        stale_timeout = self._config.stale_lock_timeout_s
+        advance_epsilon = self._config.time_advance_epsilon
+
         with self._player_lock:
             # Determine whether this tab's playback is genuinely advancing.
-            if not is_paused and (current_time - self._last_current_time) > _TIME_ADVANCE_EPSILON:
+            if not is_paused and (current_time - self._last_current_time) > advance_epsilon:
                 is_advancing = True
 
             if self._active_player_id is None:
@@ -242,9 +252,9 @@ class PhantomLyricsApp:
                 if is_advancing:
                     self._last_current_time = current_time
                     self._last_advance_time = now
-                elif (now - self._last_advance_time) >= _STALE_LOCK_TIMEOUT_S:
+                elif (now - self._last_advance_time) >= stale_timeout:
                     logger.info(
-                        f"Active player {client_id} stale for {_STALE_LOCK_TIMEOUT_S}s — "
+                        f"Active player {client_id} stale for {stale_timeout}s — "
                         f"releasing lock"
                     )
                     self._active_player_id = None
@@ -276,6 +286,21 @@ class PhantomLyricsApp:
                 logger.info(f"Active player {client_id} disconnected — releasing lock")
                 self._active_player_id = None
                 self._last_current_time = 0.0
+
+    def _on_song_change_from_monitor(self, artist: str, title: str) -> None:
+        """
+        Callback for the browser monitor (window title polling).
+
+        This is a FALLBACK — it only fires if no WebSocket message has arrived
+        recently (the extension isn't loaded, or the tab isn't a YouTube page).
+        If the WS is active, the monitor is silently ignored to avoid
+        duplicate fetches.
+        """
+        if self._last_ws_activity > 0:
+            idle = time.monotonic() - self._last_ws_activity
+            if idle < _MONITOR_FALLBACK_TIMEOUT_S:
+                return  # WebSocket is handling song detection
+        self._on_song_change(artist, title)
 
     def _on_song_change(self, artist: str, title: str) -> None:
         """
@@ -333,7 +358,9 @@ class PhantomLyricsApp:
             logger.info(
                 f"Applying {len(lyric_tuples)} synced lines for '{result.title}'"
             )
-            self._overlay.set_lyrics(result.artist, result.title, lyric_tuples)
+            self._overlay.set_lyrics(
+                result.artist, result.title, lyric_tuples, result.sync_offset
+            )
         elif result.plain_lyrics:
             # Fallback: display unsynced lyrics as static lines
             # We fake timestamps (spaced 5 seconds apart) so the scroll
@@ -343,7 +370,13 @@ class PhantomLyricsApp:
             logger.info(
                 f"Applying {len(fake_tuples)} unsynced lines for '{result.title}' (fallback)"
             )
-            self._overlay.set_lyrics(result.artist, result.title, fake_tuples)
+            self._overlay.set_lyrics(
+                result.artist, result.title, fake_tuples, result.sync_offset
+            )
+
+    def _on_sync_offset_changed(self, artist: str, title: str, offset: float) -> None:
+        """Persist a user-adjusted sync offset to the lyrics cache."""
+        save_sync_offset(artist, title, offset)
 
 
 # ─── Entry Point ─────────────────────────────────────────────────

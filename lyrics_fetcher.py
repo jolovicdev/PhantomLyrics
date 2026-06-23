@@ -49,6 +49,7 @@ class LyricsResult:
     plain_lyrics: str = ""  # Fallback: unsynced lyrics
     source_url: str = ""    # URL of the LRCLib entry (useful for debugging)
     fetched_at: float = 0.0  # Unix timestamp of when this was fetched
+    sync_offset: float = 0.0  # User-adjusted offset in seconds (persisted)
 
     @property
     def has_synced_lyrics(self) -> bool:
@@ -128,6 +129,19 @@ _session.headers.update(
     }
 )
 
+# ─── NetEase Cloud Music API (fallback source) ─────────────────
+# NetEase has a large LRC database, especially strong for Asian music and
+# niche tracks where LRCLib has gaps. This is an unofficial, key-free API.
+
+_netease_session = requests.Session()
+_netease_session.headers.update(
+    {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Referer": "https://music.163.com",
+        "Accept": "application/json",
+    }
+)
+
 # Simple in-memory cache to avoid re-fetching the same song
 _cache: dict[str, LyricsResult] = {}
 _MAX_CACHE_SIZE = 100
@@ -147,6 +161,7 @@ def _serialize_result(result: LyricsResult) -> dict:
         "plain_lyrics": result.plain_lyrics,
         "source_url": result.source_url,
         "fetched_at": result.fetched_at,
+        "sync_offset": result.sync_offset,
     }
 
 
@@ -159,6 +174,7 @@ def _deserialize_result(data: dict) -> LyricsResult:
         plain_lyrics=data.get("plain_lyrics", ""),
         source_url=data.get("source_url", ""),
         fetched_at=data.get("fetched_at", 0.0),
+        sync_offset=data.get("sync_offset", 0.0),
     )
 
 
@@ -189,6 +205,22 @@ def init_cache() -> None:
     _load_cache_from_disk()
 
 
+def save_sync_offset(artist: str, title: str, offset: float) -> None:
+    """Update the sync offset for a cached song and persist to disk."""
+    key = _cache_key(artist, title)
+    if key in _cache:
+        _cache[key].sync_offset = offset
+        _save_cache_to_disk()
+
+
+def get_sync_offset(artist: str, title: str) -> float:
+    """Return the saved sync offset for a song, or 0.0 if not cached."""
+    key = _cache_key(artist, title)
+    if key in _cache:
+        return _cache[key].sync_offset
+    return 0.0
+
+
 def _cache_key(artist: str, title: str) -> str:
     """Normalize artist + title into a cache key."""
     return f"{artist.lower().strip()}|{title.lower().strip()}"
@@ -196,15 +228,13 @@ def _cache_key(artist: str, title: str) -> str:
 
 def search_lyrics(artist: str, title: str) -> Optional[LyricsResult]:
     """
-    Search LRCLib for synchronized lyrics matching the given artist and title.
+    Search for synchronized lyrics matching the given artist and title.
 
-    Strategy:
-      1. Check in-memory cache.
-      2. Search LRCLib: GET /api/search?q=artist+title
-      3. Pick the best result (preferring synced lyrics).
-      4. If the search result has synced lyrics inline, use them.
-         Otherwise, fetch by ID: GET /api/get/{id}
-      5. Cache and return.
+    Strategy (fallback chain):
+      1. Check in-memory/disk cache.
+      2. Search LRCLib (primary source).
+      3. If LRCLib has nothing, try NetEase Cloud Music (fallback source).
+      4. Cache and return the first hit.
 
     Args:
         artist: Artist name (e.g., "Linkin Park").
@@ -220,53 +250,19 @@ def search_lyrics(artist: str, title: str) -> Optional[LyricsResult]:
         logger.debug(f"Cache hit: {artist} - {title}")
         return _cache[key]
 
-    logger.info(f"Searching LRCLib for: {artist} - {title}")
-    query = f"{artist} {title}"
+    # 2. Try LRCLib first
+    result = _search_lrclib(artist, title)
 
-    try:
-        resp = _session.get(
-            "https://lrclib.net/api/search",
-            params={"q": query},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        results = resp.json()
-    except (requests.RequestException, ValueError) as e:
-        logger.error(f"LRCLib search failed: {e}")
-        return None
+    # 3. Fallback to NetEase if LRCLib returned nothing
+    if result is None:
+        logger.info(f"Trying NetEase fallback for: {artist} - {title}")
+        result = _search_netease(artist, title)
 
-    if not results:
+    if result is None:
         logger.info(f"No results found for: {artist} - {title}")
         return None
 
-    # 2. Pick the best result
-    best = _pick_best_result(results, title, artist)
-
-    # 3. Build the result
-    synced = best.get("syncedLyrics") or ""
-    plain = best.get("plainLyrics") or ""
-
-    lyric_lines = parse_lrc(synced) if synced else []
-
-    result = LyricsResult(
-        title=best.get("trackName", title),
-        artist=best.get("artistName", artist),
-        synced_lines=lyric_lines,
-        plain_lyrics=plain,
-        source_url=f"https://lrclib.net/api/get/{best.get('id', '')}",
-        fetched_at=time.time(),
-    )
-
-    # 4. Handle edge case: search returned no synced lyrics, but has an ID
-    #    → try the direct GET endpoint which sometimes has more data.
-    if not result.has_synced_lyrics and best.get("id"):
-        logger.debug("Search returned plain lyrics only, trying direct fetch...")
-        direct = _fetch_by_id(best["id"])
-        if direct and direct.has_synced_lyrics:
-            result = direct
-            result.source_url = f"https://lrclib.net/api/get/{best['id']}"
-
-    # 5. Cache (in-memory + disk)
+    # 4. Cache (in-memory + disk)
     if len(_cache) >= _MAX_CACHE_SIZE:
         # Evict oldest entry (simple FIFO)
         oldest = next(iter(_cache))
@@ -283,6 +279,135 @@ def search_lyrics(artist: str, title: str) -> Optional[LyricsResult]:
         logger.info(f"Got plain (unsynced) lyrics for '{result.title}'")
 
     return result
+
+
+def _search_lrclib(artist: str, title: str) -> Optional[LyricsResult]:
+    """Search LRCLib for lyrics (primary source)."""
+    logger.info(f"Searching LRCLib for: {artist} - {title}")
+    query = f"{artist} {title}"
+
+    try:
+        resp = _session.get(
+            "https://lrclib.net/api/search",
+            params={"q": query},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        results = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        logger.error(f"LRCLib search failed: {e}")
+        return None
+
+    if not results:
+        return None
+
+    # Pick the best result
+    best = _pick_best_result(results, title, artist)
+
+    # Build the result
+    synced = best.get("syncedLyrics") or ""
+    plain = best.get("plainLyrics") or ""
+
+    lyric_lines = parse_lrc(synced) if synced else []
+
+    result = LyricsResult(
+        title=best.get("trackName", title),
+        artist=best.get("artistName", artist),
+        synced_lines=lyric_lines,
+        plain_lyrics=plain,
+        source_url=f"https://lrclib.net/api/get/{best.get('id', '')}",
+        fetched_at=time.time(),
+    )
+
+    # Handle edge case: search returned no synced lyrics, but has an ID
+    # → try the direct GET endpoint which sometimes has more data.
+    if not result.has_synced_lyrics and best.get("id"):
+        logger.debug("Search returned plain lyrics only, trying direct fetch...")
+        direct = _fetch_by_id(best["id"])
+        if direct and direct.has_synced_lyrics:
+            result = direct
+            result.source_url = f"https://lrclib.net/api/get/{best['id']}"
+
+    return result
+
+
+def _search_netease(artist: str, title: str) -> Optional[LyricsResult]:
+    """
+    Search NetEase Cloud Music for synced lyrics (fallback source).
+
+    Uses the unofficial API at music.163.com — no API key required.
+    Particularly strong for Asian music and tracks LRCLib doesn't have.
+    """
+    query = f"{artist} {title}".strip()
+
+    try:
+        resp = _netease_session.get(
+            "https://music.163.com/api/search/pc",
+            params={"s": query, "type": 1, "offset": 0, "limit": 10},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        logger.error(f"NetEase search failed: {e}")
+        return None
+
+    songs = data.get("result", {}).get("songs", [])
+    if not songs:
+        return None
+
+    # Pick the best match by name similarity
+    song = max(songs, key=lambda s: _title_similarity(s.get("name", ""), title))
+
+    song_id = song.get("id")
+    if not song_id:
+        return None
+
+    # Fetch the lyrics for this song
+    try:
+        lyric_resp = _netease_session.get(
+            "https://music.163.com/api/song/lyric",
+            params={"id": song_id, "lv": 1, "kv": 1, "tv": -1},
+            timeout=10,
+        )
+        lyric_resp.raise_for_status()
+        lyric_data = lyric_resp.json()
+    except (requests.RequestException, ValueError) as e:
+        logger.error(f"NetEase lyric fetch failed (ID={song_id}): {e}")
+        return None
+
+    lrc_text = lyric_data.get("lrc", {}).get("lyric", "")
+    if not lrc_text:
+        return None
+
+    artist_names = ", ".join(a.get("name", "") for a in song.get("artists", []))
+
+    logger.info(f"NetEase hit: {song.get('name', title)} - {artist_names}")
+
+    return LyricsResult(
+        title=song.get("name", title),
+        artist=artist_names or artist,
+        synced_lines=parse_lrc(lrc_text),
+        plain_lyrics="",
+        source_url=f"https://music.163.com/song?id={song_id}",
+        fetched_at=time.time(),
+    )
+
+
+def _title_similarity(a: str, b: str) -> float:
+    """Rough title similarity score (0-1) for picking the best NetEase match."""
+    a_lower = a.lower().strip()
+    b_lower = b.lower().strip()
+    if a_lower == b_lower:
+        return 1.0
+    if b_lower in a_lower or a_lower in b_lower:
+        return 0.8
+    # Shared word count as a simple heuristic
+    a_words = set(a_lower.split())
+    b_words = set(b_lower.split())
+    shared = len(a_words & b_words)
+    total = max(len(a_words), len(b_words)) or 1
+    return shared / total
 
 
 def _pick_best_result(results: list[dict], title: str, artist: str) -> dict:

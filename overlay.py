@@ -45,29 +45,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from config import Config
+
 logger = logging.getLogger(__name__)
 
-# ─── Constants ─────────────────────────────────────────────────
-
-# Overlay dimensions and layout
-OVERLAY_WIDTH = 600            # Fixed width in pixels
-MAX_VISIBLE_LINES = 3         # Lyric rows shown: previous, current, next
-LINE_SPACING_PX = 6           # Extra space between lines (added to font height)
-TITLE_GAP_PX = 12             # Extra space between the song info and the first lyric line
-SIDE_PADDING_PX = 20          # Horizontal padding from the window edge
-BOTTOM_PADDING_PX = 40        # Vertical padding from the screen bottom
-FONT_FAMILY = "Segoe UI"      # Clean, modern font available on Windows
-FONT_SIZE = 14                # Base font size in points
-
-# Opacity values (0-255 for QColor alpha)
-ACTIVE_LINE_ALPHA = 220       # ~86% opacity — stands out clearly
-INACTIVE_LINE_ALPHA = 110     # ~43% opacity — ghost-like, barely visible
-SONG_INFO_ALPHA = 80          # ~31% opacity — very subtle song info
+# ─── Internal Constants (not user-tweakable) ───────────────────
 
 # Colors
 TEXT_COLOR = QColor(255, 255, 255)  # Pure white, alpha applied per-line
 SHADOW_COLOR = QColor(0, 0, 0)      # Black outline for readability on light bg
-OUTLINE_WIDTH_PX = 3                # Stroke width around each letter (subtitle-style)
 
 # Grab handle: a near-invisible fill (alpha 1) painted across the whole window
 # so Windows delivers mouse events to every pixel (layered windows hit-test by
@@ -81,11 +67,16 @@ NO_LYRICS_MESSAGE = "No lyrics found for this song"
 # Update frequency for UI interpolation (ms)
 TICK_INTERVAL_MS = 100
 
-# Auto-hide: fade the overlay out when no timestamp arrives for this long
-AUTO_HIDE_TIMEOUT_S = 10.0    # Seconds of silence before fading out
+# Auto-hide fade parameters
 AUTO_HIDE_FADE_STEP = 0.05    # Opacity delta per tick (smooth fade)
 AUTO_HIDDEN_OPACITY = 0.0     # Fully hidden when faded out
 AUTO_SHOWN_OPACITY = 1.0      # Fully visible when faded in
+
+# Sync offset nudge buttons (shown on hover)
+SYNC_NUDGE_STEP = 0.5         # Seconds per +/- press
+SYNC_BTN_SIZE = 22            # Button side length in pixels
+SYNC_BTN_SPACING = 6          # Gap between buttons
+SYNC_BTN_MARGIN = 8           # Margin from the overlay's top-right edge
 
 # Persist the overlay position across runs
 CONFIG_DIR = Path.home() / ".phantom_lyrics"
@@ -101,11 +92,13 @@ class LyricsOverlay(QWidget):
     for maximum control over transparency and positioning.
     """
 
-    # Signal to safely update UI state from any thread
+    # Signals to safely update UI state from any thread
     update_requested = Signal()
+    sync_offset_changed = Signal(str, str, float)  # (artist, title, new_offset)
 
-    def __init__(self) -> None:
+    def __init__(self, config: Config) -> None:
         super().__init__()
+        self._cfg = config
 
         # ── Window state ──────────────────────────────────────
         self._lyric_lines: list[tuple[float, str]] = []  # [(timestamp, text), ...]
@@ -116,6 +109,12 @@ class LyricsOverlay(QWidget):
         self._no_lyrics: bool = False                     # Show "no lyrics" message?
         self._last_activity_time: float = 0.0             # Last WS message time (monotonic)
         self._target_opacity: float = AUTO_SHOWN_OPACITY  # Fade target
+        self._sync_offset: float = 0.0                    # User-adjusted lyric offset (seconds)
+        self._hovered: bool = False                       # Mouse is over the overlay?
+        self._sync_btn_rects: dict[str, QRect] = {}       # Button hit-test rects (set in paintEvent)
+        self._pressed_btn: str | None = None              # Which button was just pressed (flash effect)
+        self._feedback_text: str = ""                     # Temporary toast text (e.g. "Sync: +1.0s")
+        self._feedback_until: float = 0.0                 # Monotonic time when the toast expires
 
         # ── Drag state ───────────────────────────────────────
         self._drag_offset = None  # QPoint: cursor-to-window-origin offset while dragging
@@ -136,6 +135,7 @@ class LyricsOverlay(QWidget):
         artist: str,
         title: str,
         lyric_lines: list[tuple[float, str]],
+        sync_offset: float = 0.0,
     ) -> None:
         """
         Replace the current lyrics with a new song.
@@ -147,6 +147,7 @@ class LyricsOverlay(QWidget):
             title: Song title (for the subtle header).
             lyric_lines: List of (timestamp_seconds, lyric_text) tuples,
                          sorted by timestamp.
+            sync_offset: Saved lyric sync offset for this song (seconds).
         """
         self._song_artist = artist
         self._song_title = title
@@ -156,7 +157,13 @@ class LyricsOverlay(QWidget):
         self._current_line_index = -1
         self._current_time = 0.0
         self._no_lyrics = False
+        self._sync_offset = sync_offset
         self.update_requested.emit()
+
+    def set_sync_offset(self, offset: float) -> None:
+        """Set the lyric sync offset (seconds). Called from the Qt thread."""
+        self._sync_offset = offset
+        self.update()
 
     def set_timestamp(self, current_time: float) -> None:
         """
@@ -187,6 +194,24 @@ class LyricsOverlay(QWidget):
         else:
             self.hide()
 
+    def apply_config(self, config: Config) -> None:
+        """Apply updated config settings at runtime (from the settings dialog)."""
+        self._cfg = config
+        # Recalculate window size for the new font/layout settings
+        font = QFont(config.font_family, config.font_size)
+        fm = QFontMetrics(font)
+        line_height = fm.height() + config.line_spacing_px
+        buttons_space = SYNC_BTN_SIZE + SYNC_BTN_MARGIN
+        window_height = (
+            (config.max_visible_lines * line_height)
+            + line_height
+            + buttons_space
+            + config.side_padding_px
+        )
+        self.setFixedSize(config.overlay_width, window_height)
+        self.update()
+        logger.info("Overlay config applied and resized.")
+
     def reset_position(self) -> None:
         """Move the overlay back to its default bottom-left position."""
         screen = QApplication.primaryScreen()
@@ -194,8 +219,8 @@ class LyricsOverlay(QWidget):
             screen_geom: QRect = screen.availableGeometry()
         else:
             screen_geom = QRect(0, 0, 1920, 1080)
-        x = SIDE_PADDING_PX
-        y = screen_geom.bottom() - self.height() - BOTTOM_PADDING_PX
+        x = self._cfg.side_padding_px
+        y = screen_geom.bottom() - self.height() - self._cfg.bottom_padding_px
         self.move(x, y)
         self._save_position()
         logger.info("Overlay position reset to bottom-left.")
@@ -251,16 +276,23 @@ class LyricsOverlay(QWidget):
             screen_geom = QRect(0, 0, 1920, 1080)
 
         # Calculate window height: song info header + visible lyric lines
-        font = QFont(FONT_FAMILY, FONT_SIZE)
+        font = QFont(self._cfg.font_family, self._cfg.font_size)
         fm = QFontMetrics(font)
-        line_height = fm.height() + LINE_SPACING_PX
-        window_height = (MAX_VISIBLE_LINES * line_height) + line_height + SIDE_PADDING_PX
+        line_height = fm.height() + self._cfg.line_spacing_px
+        # Height: song info header + lyric lines + space for sync buttons below
+        buttons_space = SYNC_BTN_SIZE + SYNC_BTN_MARGIN
+        window_height = (
+            (self._cfg.max_visible_lines * line_height)
+            + line_height
+            + buttons_space
+            + self._cfg.side_padding_px
+        )
 
-        x = SIDE_PADDING_PX
-        y = screen_geom.bottom() - window_height - BOTTOM_PADDING_PX
+        x = self._cfg.side_padding_px
+        y = screen_geom.bottom() - window_height - self._cfg.bottom_padding_px
 
-        self.setGeometry(x, y, OVERLAY_WIDTH, window_height)
-        self.setFixedSize(OVERLAY_WIDTH, window_height)
+        self.setGeometry(x, y, self._cfg.overlay_width, window_height)
+        self.setFixedSize(self._cfg.overlay_width, window_height)
 
         # Restore the last saved position (overrides the default bottom-left)
         self._load_position()
@@ -287,27 +319,30 @@ class LyricsOverlay(QWidget):
         # fully transparent areas would otherwise ignore mouse clicks).
         painter.fillRect(self.rect(), GRAB_FILL_COLOR)
 
-        font = QFont(FONT_FAMILY, FONT_SIZE)
+        font = QFont(self._cfg.font_family, self._cfg.font_size)
         fm = QFontMetrics(font)
-        line_height = fm.height() + LINE_SPACING_PX
+        line_height = fm.height() + self._cfg.line_spacing_px
+
+        overlay_width = self._cfg.overlay_width
+        side_padding = self._cfg.side_padding_px
 
         def center_x(text: str) -> int:
             """Horizontal x so text is centered within the overlay width."""
-            return (OVERLAY_WIDTH - fm.horizontalAdvance(text)) // 2
+            return (overlay_width - fm.horizontalAdvance(text)) // 2
 
         # ── Song info line (very subtle) ──────────────────
         if self._song_title:
             painter.setFont(font)
             info_text = f"{self._song_artist} — {self._song_title}" if self._song_artist else self._song_title
             baseline = fm.ascent() + 4
-            self._draw_outlined_text(painter, center_x(info_text), baseline, info_text, SONG_INFO_ALPHA)
+            self._draw_outlined_text(painter, center_x(info_text), baseline, info_text, self._cfg.song_info_alpha)
 
         # ── "No lyrics found" message ─────────────────────
         if self._no_lyrics:
             painter.setFont(font)
-            y_offset = line_height + TITLE_GAP_PX  # gap below song info
+            y_offset = line_height + self._cfg.title_gap_px  # gap below song info
             self._draw_outlined_text(
-                painter, center_x(NO_LYRICS_MESSAGE), y_offset + fm.ascent(), NO_LYRICS_MESSAGE, INACTIVE_LINE_ALPHA
+                painter, center_x(NO_LYRICS_MESSAGE), y_offset + fm.ascent(), NO_LYRICS_MESSAGE, self._cfg.inactive_line_alpha
             )
             painter.end()
             return
@@ -319,29 +354,106 @@ class LyricsOverlay(QWidget):
         # ── Lyric lines ───────────────────────────────────
         visible_lines = self._get_visible_window()
 
-        y_offset = line_height + TITLE_GAP_PX  # gap below song info
+        y_offset = line_height + self._cfg.title_gap_px  # gap below song info
 
         for idx, line_text in visible_lines:
             painter.setFont(font)
 
             # Determine opacity based on whether this is the active line
             if idx == self._current_line_index:
-                alpha = ACTIVE_LINE_ALPHA
+                alpha = self._cfg.active_line_alpha
             else:
-                alpha = INACTIVE_LINE_ALPHA
+                alpha = self._cfg.inactive_line_alpha
                 # Optional: gradient fade for lines further from active
                 distance = abs(idx - self._current_line_index)
                 if distance > 0:
                     # Reduce alpha by 15 per step away, floor at 25
-                    fade = max(25, INACTIVE_LINE_ALPHA - (distance - 1) * 15)
+                    fade = max(25, self._cfg.inactive_line_alpha - (distance - 1) * 15)
                     alpha = fade
 
             self._draw_outlined_text(painter, center_x(line_text), y_offset + fm.ascent(), line_text, alpha)
             y_offset += line_height
 
+        # ── Sync nudge buttons (when hovering, or during feedback) ───
+        show_buttons = self._hovered or (
+            self._feedback_text and time.monotonic() < self._feedback_until
+        )
+        if show_buttons:
+            self._draw_sync_buttons(painter, fm, y_offset)
+
         painter.end()
 
     # ─── Internals ────────────────────────────────────────────
+
+    def _draw_sync_buttons(self, painter: QPainter, fm: QFontMetrics, lyrics_bottom: int) -> None:
+        """
+        Draw small [−] [0] [+] buttons centered below the lyrics, plus a sync
+        offset indicator. Shown when hovering or during the 2s feedback window
+        after a press. Button rects are stored for hit-testing in mousePressEvent.
+
+        Args:
+            lyrics_bottom: Y coordinate of the bottom of the last lyric line.
+        """
+        btn_font = QFont(self._cfg.font_family, max(self._cfg.font_size - 4, 8))
+        size = SYNC_BTN_SIZE
+        spacing = SYNC_BTN_SPACING
+
+        # Three buttons: [−] [0] [+]
+        labels = [("minus", "\u2212"), ("reset", "0"), ("plus", "+")]
+        total_width = len(labels) * size + (len(labels) - 1) * spacing
+        start_x = (self._cfg.overlay_width - total_width) // 2
+        btn_y = lyrics_bottom + SYNC_BTN_MARGIN
+
+        self._sync_btn_rects.clear()
+
+        painter.setFont(btn_font)
+
+        # Clear the pressed-flash after 150ms
+        pressed = self._pressed_btn
+        if pressed and time.monotonic() >= self._feedback_until - 1.85:
+            pressed = None
+            self._pressed_btn = None
+
+        for i, (btn_id, label) in enumerate(labels):
+            x = start_x + i * (size + spacing)
+            rect = QRect(x, btn_y, size, size)
+            self._sync_btn_rects[btn_id] = rect
+
+            # Button background — brighter when pressed
+            if btn_id == pressed:
+                painter.setPen(QPen(QColor(255, 255, 255, 120)))
+                painter.setBrush(QBrush(QColor(255, 255, 255, 80)))
+            else:
+                painter.setPen(QPen(QColor(255, 255, 255, 40)))
+                painter.setBrush(QBrush(QColor(0, 0, 0, 120)))
+            painter.drawRoundedRect(rect, 4, 4)
+
+            # Button label — brighter when pressed
+            label_alpha = 255 if btn_id == pressed else 200
+            painter.setPen(QPen(QColor(255, 255, 255, label_alpha)))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, label)
+
+        # Sync offset toast — shows for 2s after a press (even if not hovering)
+        if self._feedback_text and time.monotonic() < self._feedback_until:
+            indicator_font = QFont(self._cfg.font_family, max(self._cfg.font_size - 4, 8))
+            painter.setFont(indicator_font)
+            painter.setPen(QPen(QColor(255, 255, 255, 220)))
+            ind_fm = QFontMetrics(indicator_font)
+            text_width = ind_fm.horizontalAdvance(self._feedback_text)
+            ix = (self._cfg.overlay_width - text_width) // 2
+            iy = btn_y + size + 4 + ind_fm.ascent()
+            painter.drawText(ix, iy, self._feedback_text)
+        elif self._hovered and abs(self._sync_offset) > 0.01:
+            # While hovering with a non-zero offset, show it subtly
+            offset_text = f"Sync: {self._sync_offset:+.1f}s"
+            indicator_font = QFont(self._cfg.font_family, max(self._cfg.font_size - 4, 8))
+            painter.setFont(indicator_font)
+            painter.setPen(QPen(QColor(255, 255, 255, 160)))
+            ind_fm = QFontMetrics(indicator_font)
+            text_width = ind_fm.horizontalAdvance(offset_text)
+            ix = (self._cfg.overlay_width - text_width) // 2
+            iy = btn_y + size + 4 + ind_fm.ascent()
+            painter.drawText(ix, iy, offset_text)
 
     def _draw_outlined_text(
         self,
@@ -366,7 +478,7 @@ class LyricsOverlay(QWidget):
         outline_color = QColor(SHADOW_COLOR)
         outline_color.setAlpha(alpha)
         outline_pen = QPen(outline_color)
-        outline_pen.setWidthF(OUTLINE_WIDTH_PX)
+        outline_pen.setWidthF(self._cfg.outline_width_px)
         outline_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         outline_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(outline_pen)
@@ -392,25 +504,26 @@ class LyricsOverlay(QWidget):
             return []
 
         total = len(self._lyric_lines)
+        max_lines = self._cfg.max_visible_lines
         if self._current_line_index < 0:
             # No active line yet — show the first few lines
-            end = min(MAX_VISIBLE_LINES, total)
+            end = min(max_lines, total)
             return [(i, self._lyric_lines[i][1]) for i in range(end)]
 
         # Show a window of lines centered on the active line
-        half = MAX_VISIBLE_LINES // 2
+        half = max_lines // 2
         start = max(0, self._current_line_index - half)
-        end = min(total, start + MAX_VISIBLE_LINES)
+        end = min(total, start + max_lines)
 
         # Adjust start if we're near the end
-        if end - start < MAX_VISIBLE_LINES:
-            start = max(0, end - MAX_VISIBLE_LINES)
+        if end - start < max_lines:
+            start = max(0, end - max_lines)
 
         return [(i, self._lyric_lines[i][1]) for i in range(start, end)]
 
     def _find_active_line(self) -> int:
         """
-        Find the lyric line whose timestamp is <= current_time
+        Find the lyric line whose timestamp is <= (current_time + sync_offset)
         and is the most recent one.
 
         Returns:
@@ -419,9 +532,10 @@ class LyricsOverlay(QWidget):
         if not self._lyric_lines:
             return -1
 
+        effective_time = self._current_time + self._sync_offset
         active = -1
         for i, (ts, _text) in enumerate(self._lyric_lines):
-            if ts <= self._current_time:
+            if ts <= effective_time:
                 active = i
             else:
                 break  # Lines are sorted by timestamp
@@ -433,10 +547,10 @@ class LyricsOverlay(QWidget):
     @Slot()
     def _tick(self) -> None:
         """Called by the timer to refresh the active line, auto-hide, and repaint."""
-        # ── Auto-hide: fade out if no activity for AUTO_HIDE_TIMEOUT_S ──
+        # ── Auto-hide: fade out if no activity for auto_hide_timeout_s ──
         if self._last_activity_time > 0:
             idle = time.monotonic() - self._last_activity_time
-            if idle >= AUTO_HIDE_TIMEOUT_S:
+            if idle >= self._cfg.auto_hide_timeout_s:
                 self._target_opacity = AUTO_HIDDEN_OPACITY
 
         # Smoothly approach the target opacity
@@ -462,11 +576,30 @@ class LyricsOverlay(QWidget):
             self._current_line_index = new_index
         self.update()
 
-    # ─── Drag-and-Drop ───────────────────────────────────────
+    # ─── Drag-and-Drop + Hover Buttons ──────────────────────
+
+    def enterEvent(self, event) -> None:
+        """Mouse entered the overlay — show sync buttons."""
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        """Mouse left the overlay — hide sync buttons."""
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
 
     def mousePressEvent(self, event) -> None:
-        """Start dragging on left mouse press."""
+        """Handle sync button clicks, or start dragging if not on a button."""
         if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position().toPoint()
+            # Check if the click landed on a sync button
+            for btn_id, rect in self._sync_btn_rects.items():
+                if rect.contains(pos):
+                    self._handle_sync_button(btn_id)
+                    return
+            # Not on a button — start dragging
             self._drag_offset = event.globalPosition().toPoint() - self.pos()
 
     def mouseMoveEvent(self, event) -> None:
@@ -481,6 +614,29 @@ class LyricsOverlay(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_offset = None
             self._save_position()
+
+    def _handle_sync_button(self, btn_id: str) -> None:
+        """Handle a sync nudge button click with visual feedback."""
+        if btn_id == "minus":
+            self._sync_offset -= SYNC_NUDGE_STEP
+        elif btn_id == "plus":
+            self._sync_offset += SYNC_NUDGE_STEP
+        elif btn_id == "reset":
+            self._sync_offset = 0.0
+        else:
+            return
+
+        # Flash the pressed button + show a temporary toast
+        self._pressed_btn = btn_id
+        self._feedback_text = f"Sync: {self._sync_offset:+.1f}s"
+        self._feedback_until = time.monotonic() + 2.0  # toast visible for 2s
+
+        # Notify the main app to persist the offset in the cache
+        self.sync_offset_changed.emit(
+            self._song_artist, self._song_title, self._sync_offset
+        )
+        logger.info(f"Sync offset set to {self._sync_offset:+.1f}s")
+        self.update()
 
     def _save_position(self) -> None:
         """Persist the overlay's current position so it survives restarts."""

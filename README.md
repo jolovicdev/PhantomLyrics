@@ -1,21 +1,21 @@
 # Phantom Lyrics 🎵
 
-A "ghost-like" desktop overlay that displays synchronized song lyrics in the bottom-left corner of your screen while you play games or code. Works with YouTube Music in Firefox.
+A "ghost-like" desktop overlay that displays synchronized song lyrics anywhere on your screen while you play games or code. Works with YouTube Music in Firefox.
 
 ## How It Works
 
 ```
 YouTube (Firefox) ──► Firefox Extension ──WebSocket──► Python App
-       │                                                    │
-       └── Window Title ──► Browser Monitor ──► Lyrics Fetch (LRCLib)
-                                                            │
-                                               PySide6 Overlay Window ◄──
+        │                                                    │
+        └── Window Title ──► Browser Monitor ──► Lyrics Fetch (LRCLib → NetEase)
+                                                             │
+                                                PySide6 Overlay Window ◄──
 ```
 
-1. **Browser Monitor** reads the Firefox window title to detect the current song.
-2. **Firefox Extension** sends the exact video timestamp via WebSocket.
-3. **LRCLib API** provides synchronized (LRC) lyrics.
-4. **PySide6 Overlay** displays lyrics with a transparent, always-on-top, free-draggable window.
+1. **Firefox Extension** sends the exact video timestamp and page title via WebSocket (works even with the YouTube tab in the background).
+2. **Lyrics Fetcher** queries LRCLib first, then falls back to NetEase Cloud Music for tracks LRCLib doesn't have. Results are cached to disk.
+3. **PySide6 Overlay** displays lyrics with a transparent, always-on-top, free-draggable window with subtitle-style outlined text.
+4. **Browser Monitor** is a fallback — it polls the Firefox window title only if the extension isn't sending data (e.g. extension not loaded).
 
 ## Project Structure
 
@@ -24,11 +24,14 @@ Phantom Lyrics/
 ├── phantom_lyrics.py      # Main app — orchestrates everything
 ├── overlay.py             # PySide6 transparent overlay window
 ├── websocket_server.py    # Local WebSocket server (receives timestamps)
-├── browser_monitor.py     # Firefox window title polling + song detection
-├── lyrics_fetcher.py      # LRCLib API client + LRC parser + disk cache
-├── tray.py                # System tray icon (toggle, reset, quit)
+├── browser_monitor.py     # Firefox window title polling (fallback)
+├── lyrics_fetcher.py      # LRCLib + NetEase API client, LRC parser, disk cache
+├── config.py              # User settings (load/save from ~/.phantom_lyrics/config.json)
+├── settings_dialog.py     # Settings dialog (font, opacity, layout, auto-hide)
+├── tray.py                # System tray icon (toggle, reset, settings, quit)
 ├── phantom_lyrics.spec    # PyInstaller build config
-├── requirements.txt       # Python dependencies
+├── requirements.txt       # Runtime Python dependencies
+├── requirements-dev.txt   # Dev dependencies (includes PyInstaller)
 └── firefox_extension/
     ├── manifest.json      # Firefox add-on manifest
     └── content.js         # Content script — sends timestamps to Python
@@ -59,13 +62,13 @@ python phantom_lyrics.py
 ### 4. Play a Song
 
 1. Open a YouTube music video in Firefox.
-2. The overlay should appear in the bottom-left corner of your screen.
-3. Lyrics will highlight in sync with the music — automatically.
+2. The overlay should appear — lyrics load automatically, even if the YouTube tab isn't focused.
+3. Lyrics highlight in sync with the music.
 
 ### 5. Build a Standalone .exe (optional)
 
 ```powershell
-pip install pyinstaller
+pip install -r requirements-dev.txt
 pyinstaller phantom_lyrics.spec --noconfirm
 ```
 
@@ -77,12 +80,57 @@ When the app is running, a tray icon appears in the Windows system tray:
 
 - **Left-click** — toggle the overlay visibility (show/hide).
 - **Right-click → Reset position** — move the overlay back to the bottom-left corner.
+- **Right-click → Settings...** — open the settings dialog (font, opacity, layout, auto-hide).
 - **Right-click → Quit** — exit the app.
+
+## Settings
+
+All settings are configurable via the tray icon → **Settings...** dialog and persisted to `~/.phantom_lyrics/config.json`:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Font family | Segoe UI | Font for lyrics (dropdown: Segoe UI, Consolas, Georgia) |
+| Font size | 14 | Font size in points |
+| Overlay width | 600 | Width of the overlay in pixels |
+| Visible lines | 3 | How many lyric lines to show (previous/current/next) |
+| Outline width | 3 | Black stroke width around each letter (subtitle style) |
+| Active line opacity | 220 | Opacity of the active line (0-255) |
+| Inactive line opacity | 110 | Opacity of inactive lines (0-255) |
+| Auto-hide timeout | 10s | Seconds of silence before the overlay fades out |
+
+## Sync Offset
+
+If the synced lyrics are slightly ahead or behind the audio, you can nudge them:
+
+1. **Hover** over the overlay — three buttons appear below the lyrics: `[−] [0] [+]`
+2. **`[−]`** — nudge lyrics 0.5s earlier (for LRC that's delayed)
+3. **`[+]`** — nudge lyrics 0.5s later
+4. **`[0]`** — reset offset to 0
+5. A `Sync: +1.0s` toast appears for 2 seconds after each press so you see the current offset.
+6. The offset is **saved per-song** in the lyrics cache — next time you play the same song, the offset is restored automatically.
 
 ## Auto-hide
 
 If no music is playing for ~10 seconds (the extension stops sending timestamps), the overlay fades out automatically. It fades back in the moment music resumes. This keeps your screen clean when you pause or close YouTube.
-3. Lyrics will highlight in sync with the music — automatically.
+
+## Multi-Tab Support
+
+If you have multiple YouTube tabs open, the app uses **lock-on + time-advance verification** to ensure only the tab that's actually playing drives the lyrics:
+
+- The first tab with actively advancing playback claims the lock.
+- Other tabs are ignored entirely (no flicker between songs).
+- The lock releases when the active tab pauses, navigates to a new video, or closes.
+- A glitchy background tab can't steal the lock — its `currentTime` isn't advancing.
+
+## Lyrics Sources
+
+The app queries lyrics APIs in order and uses the first hit:
+
+1. **Disk cache** (`~/.phantom_lyrics/lyrics_cache.json`) — previously played songs load instantly, even offline. Holds up to 100 songs.
+2. **[LRCLib](https://lrclib.net)** — free, open-source lyrics database (primary source).
+3. **[NetEase Cloud Music](https://music.163.com)** — large database, strong for Asian music and niche tracks where LRCLib has gaps (fallback source, no API key needed).
+
+If no source has the song, the overlay shows "No lyrics found for this song."
 
 ## How to Use While Gaming
 
@@ -97,38 +145,22 @@ The overlay is **free-draggable** — no lock, no hotkey, no toggle.
 
 - **Click and drag** the overlay anywhere on your screen, anytime.
 - Release the mouse to drop it; the position is saved automatically.
-- The position is persisted to `~/.phantom_lyrics/overlay_position.json`
-  and restored on the next launch.
+- The position is persisted to `~/.phantom_lyrics/overlay_position.json` and restored on the next launch.
 
-> Note: because the overlay is always grabbable, clicks *on* the overlay
-> won't pass through to the game. The overlay is small, so just drag it
-> out of the way if you need to click something behind it.
+> Note: because the overlay is always grabbable, clicks *on* the overlay won't pass through to the game. The overlay is small, so just drag it out of the way if you need to click something behind it.
 
 ## UI Design
 
 | Feature | Detail |
 |---------|--------|
-| Position | Bottom-left corner |
-| Background | 100% transparent |
+| Position | Free-draggable anywhere (saved across runs) |
+| Background | 100% transparent — no box or frame |
+| Text outline | Black stroke around every letter (subtitle-style, readable on any background) |
 | Active line | ~86% opacity white |
 | Other lines | ~43% opacity white (fades with distance) |
 | Song info | ~31% opacity white (very subtle) |
-| Font | Segoe UI, 14pt |
+| Font | Segoe UI, 14pt (configurable) |
 | Click behavior | Grabbable (drag to move); never steals focus |
-
-## Configuration
-
-Edit the constants at the top of each file:
-
-| Constant | File | Default | Description |
-|----------|------|---------|-------------|
-| `OVERLAY_WIDTH` | `overlay.py` | 600 | Width of the overlay in pixels |
-| `MAX_VISIBLE_LINES` | `overlay.py` | 3 | How many lyric lines to show (previous/current/next) |
-| `FONT_SIZE` | `overlay.py` | 14 | Font size in points |
-| `ACTIVE_LINE_ALPHA` | `overlay.py` | 220 | Opacity of the active line (0-255) |
-| `INACTIVE_LINE_ALPHA` | `overlay.py` | 110 | Opacity of inactive lines (0-255) |
-| `POLL_INTERVAL` | `browser_monitor.py` | 2.0 | How often to check Firefox title (seconds) |
-| `WS_HOST / WS_PORT` | `websocket_server.py` | localhost:8765 | WebSocket bind address |
 
 ## Troubleshooting
 
@@ -137,8 +169,10 @@ Edit the constants at the top of each file:
 | No overlay visible | Check that the Python app started without errors in the terminal |
 | Overlay shows but no lyrics | Make sure you're on a YouTube **video** page (not homepage/search). The Firefox tab title must contain "YouTube" + "Mozilla Firefox". |
 | Lyrics not syncing | Check the terminal for "Client connected" — if not, reload the Firefox extension at `about:debugging` |
+| Lyrics slightly off | Hover over the overlay and use the `[−]` / `[+]` buttons to nudge sync. The offset is saved per-song. |
 | Can't click things behind overlay | The overlay is always grabbable, so clicks on it don't pass through. Drag it out of the way first. |
-| "No lyrics found" | The song might not be in LRCLib. Try a more popular song to test. LRCLib: https://lrclib.net |
+| "No lyrics found" | The song isn't in LRCLib or NetEase. The app queries both automatically. |
+| Multiple tabs cause flicker | The app locks onto the actively playing tab. Make sure only one tab is actually playing audio. |
 
 ## Tech Stack
 
@@ -146,10 +180,11 @@ Edit the constants at the top of each file:
 - **PySide6** — Transparent overlay GUI
 - **pywin32** — Windows API (layered window, no-focus, window enumeration)
 - **websockets** — Async WebSocket server
-- **requests** — LRCLib API client
+- **requests** — LRCLib + NetEase API client
 - **Firefox WebExtension** — YouTube timestamp extraction
 
 ## Credits
 
 - Lyrics data from [LRCLib](https://lrclib.net) — a free, open-source lyrics database.
+- Fallback lyrics from [NetEase Cloud Music](https://music.163.com).
 - Inspired by the desire to read lyrics without alt-tabbing during games.

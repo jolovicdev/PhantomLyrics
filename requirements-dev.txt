@@ -1,0 +1,8 @@
+# Phantom Lyrics - Development Dependencies
+# Install with: pip install -r requirements-dev.txt
+# (This also installs the runtime requirements via requirements.txt)
+
+-r requirements.txt
+
+# Building a standalone .exe
+pyinstaller>=6.0.0
