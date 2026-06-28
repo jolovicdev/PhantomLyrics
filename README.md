@@ -1,6 +1,6 @@
 # Phantom Lyrics 🎵
 
-A "ghost-like" desktop overlay that displays synchronized song lyrics anywhere on your screen while you play games or code. Works with YouTube Music in Firefox.
+A "ghost-like" desktop overlay that displays synchronized song lyrics anywhere on your screen while you play games or code. Works with YouTube Music in Firefox, Chrome, Brave, Edge, and Opera.
 
 ![Phantom Lyrics Demo](assets/app-demo.gif)
 
@@ -14,14 +14,14 @@ The overlay sits on top of your game with click-through gaming mode — you see 
 ## How It Works
 
 ```
-YouTube (Firefox) ──► Firefox Extension ──WebSocket──► Python App
-        │                                                    │
-        └── Page Title ──► Title Parser ──► Lyrics Fetch (LRCLib → NetEase)
-                                                             │
-                                                PySide6 Overlay Window ◄──
+YouTube ──► Browser Extension ──WebSocket──► Python App
+    │                                            │
+    └── Page Title ──► Title Parser ──► Lyrics Fetch (LRCLib → NetEase)
+                                                 │
+                                    PySide6 Overlay Window ◄──
 ```
 
-1. **Firefox Extension** sends the exact video timestamp and page title via WebSocket (works even with the YouTube tab in the background).
+1. **Browser Extension** (Firefox or Chromium) sends the exact video timestamp and page title via WebSocket (works even with the YouTube tab in the background).
 2. **Title Parser** cleans the YouTube page title into "Artist - Title" (handles en-dash, em-dash, tab counters, video tags).
 3. **Lyrics Fetcher** queries LRCLib first, then falls back to NetEase Cloud Music for tracks LRCLib doesn't have. Results are cached to disk.
 4. **PySide6 Overlay** displays lyrics with a transparent, always-on-top, free-draggable window with subtitle-style outlined text.
@@ -42,9 +42,12 @@ Phantom Lyrics/
 ├── phantom_lyrics.spec    # PyInstaller build config
 ├── requirements.txt       # Runtime Python dependencies
 ├── requirements-dev.txt   # Dev dependencies (includes PyInstaller)
-└── firefox_extension/
-    ├── manifest.json      # Firefox add-on manifest
-    └── content.js         # Content script — sends timestamps to Python
+├── firefox_extension/
+│   ├── manifest.json      # Firefox add-on manifest (MV2)
+│   └── content.js         # Content script — sends timestamps to Python
+└── chrome_extension/
+    ├── manifest.json      # Chrome/Brave/Edge/Opera manifest (MV3)
+    └── content.js         # Same content script — works on all Chromium browsers
 ```
 
 ## Setup Instructions
@@ -55,15 +58,35 @@ Phantom Lyrics/
 pip install -r requirements.txt
 ```
 
-### 2. Load the Firefox Extension
+### 2. Load the Browser Extension
 
-The extension is **required** — it's how the app detects the current song and syncs lyrics. Without it, no lyrics will appear.
+The extension is **required** — it's how the app detects the current song and syncs lyrics. Without it, no lyrics will appear. Pick your browser:
+
+#### Firefox
 
 1. Open Firefox.
 2. Go to `about:debugging#/runtime/this-firefox`.
 3. Click **"Load Temporary Add-on..."**.
-4. Select the file: `firefox_extension/manifest.json`.
+4. Select `firefox_extension/manifest.json`.
 5. The extension icon won't appear in the toolbar — that's normal. It runs silently on YouTube pages.
+
+#### Chrome / Brave / Edge / Opera (Chromium)
+
+Works the same on all Chromium-based browsers — just use the correct URL:
+
+1. Open your browser's extensions page:
+
+   | Browser | URL |
+   |---------|-----|
+   | Chrome  | `chrome://extensions` |
+   | Brave   | `brave://extensions` |
+   | Edge    | `edge://extensions` |
+   | Opera   | `opera://extensions` |
+
+2. Toggle **"Developer mode"** on (top-right corner).
+3. Click **"Load unpacked"**.
+4. Select the `chrome_extension/` folder (not a single file — the whole folder).
+5. The extension will appear in the list. It runs silently on YouTube pages — no toolbar icon.
 
 ### 3. Run the Desktop App
 
@@ -73,7 +96,7 @@ python phantom_lyrics.py
 
 ### 4. Play a Song
 
-1. Open a YouTube music video in Firefox.
+1. Open a YouTube music video in your browser.
 2. The overlay should appear — lyrics load automatically, even if the YouTube tab isn't focused.
 3. Lyrics highlight in sync with the music.
 
@@ -199,8 +222,8 @@ The overlay is **free-draggable** — no lock, no hotkey, no toggle.
 | Problem | Solution |
 |---------|----------|
 | No overlay visible | Check that the Python app started without errors in the terminal |
-| Overlay shows but no lyrics | Make sure you're on a YouTube **video** page (not homepage/search). The Firefox tab title must contain "YouTube" + "Mozilla Firefox". |
-| Lyrics not syncing | Check the terminal for "Client connected" — if not, reload the Firefox extension at `about:debugging` |
+| Overlay shows but no lyrics | Make sure you're on a YouTube **video** page (not homepage/search). For Firefox the tab title must contain "YouTube" + "Mozilla Firefox". |
+| Lyrics not syncing | Check the terminal for "Client connected" — if not, reload the extension (Firefox: `about:debugging`, Chrome: `chrome://extensions`) |
 | Lyrics slightly off | Hover over the overlay and use the `[−]` / `[+]` buttons to nudge sync. The offset is saved per-song. |
 | Can't click things behind overlay | The overlay is always grabbable, so clicks on it don't pass through. Drag it out of the way first. |
 | "No lyrics found" | The song isn't in LRCLib or NetEase. The app queries both automatically. |
@@ -214,7 +237,7 @@ The overlay is **free-draggable** — no lock, no hotkey, no toggle.
 - **websockets** — Async WebSocket server
 - **requests** — LRCLib + NetEase API client
 - **pynput** — Global hotkey for gaming-mode toggle
-- **Firefox WebExtension** — YouTube timestamp extraction
+- **Firefox + Chromium WebExtension** — YouTube timestamp extraction (supports all major browsers)
 
 ## Credits
 
